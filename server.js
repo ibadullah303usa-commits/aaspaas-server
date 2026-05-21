@@ -141,52 +141,86 @@ async function makeThreeVariants(cutPath, tmpDir, job, bannerPath) {
 
 function applyOverlay(input, config, bannerPath) {
   return new Promise((resolve, reject) => {
-    const hookY = config.hookPos === 'top' ? 'h*0.21' : 'h*0.65';
+
+    const hookY   = config.hookPos   === 'top'    ? 'h*0.21' : 'h*0.65';
     const bannerY = config.bannerPos === 'bottom' ? 'h*0.65' : 'h*0.21';
 
-    // ✅ ٹیکسٹ کو FFmpeg safe بنائیں
+    // Urdu text safe کریں
     const safeHook = (config.hook || '')
       .replace(/\\/g, '')
       .replace(/'/g, '\u2019')
       .replace(/:/g, '\u02D0')
-      .replace(/\[/g, '(')
-      .replace(/\]/g, ')')
+      .replace(/\[/g, '')
+      .replace(/\]/g, '')
       .trim();
 
+    const hasBanner = bannerPath && fs.existsSync(bannerPath);
+    const hasHook   = safeHook.length > 0;
+
+    // Font path — Railway پر یہ path ہوگا
+    const fontPath = '/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf';
+
     let filterComplex = '';
-    let inputArgs = ['-i', input];
 
-    if (bannerPath && fs.existsSync(bannerPath)) {
-      // بینر اور ٹیکسٹ دونوں
-      inputArgs = ['-i', input, '-i', bannerPath];
+    if (hasBanner && hasHook) {
 
-      const bannerScale = `[1:v]scale=iw*min(1080/iw\\,1920*0.28/ih):ih*min(1080/iw\\,1920*0.28/ih)[banner]`;
-      const overlayBanner = `[0:v][banner]overlay=(W-w)/2:${bannerY}[withbanner]`;
+      filterComplex = [
+        `[1:v]scale=-1:iw*0.22[banner]`,
+        `[0:v][banner]overlay=(W-w)/2:${bannerY}[withbanner]`,
+        `[withbanner]drawtext=` +
+          `fontfile=${fontPath}:` +
+          `text='${safeHook}':` +
+          `fontcolor=white:` +
+          `fontsize=52:` +
+          `x=(w-text_w)/2:` +
+          `y=${hookY}-text_h/2:` +
+          `box=1:` +
+          `boxcolor=0x${config.hookColor}@0.92:` +
+          `boxborderw=22:` +
+          `line_spacing=8` +
+        `[out]`
+      ].join(';');
 
-      if (safeHook) {
-        filterComplex = `${bannerScale};${overlayBanner};[withbanner]drawtext=text='${safeHook}':fontcolor=white:fontsize=42:x=(w-text_w)/2:y=${hookY}:box=1:boxcolor=0x${config.hookColor}@0.92:boxborderw=16[out]`;
-      } else {
-        filterComplex = `${bannerScale};${overlayBanner}[out]`;
-      }
+    } else if (hasBanner && !hasHook) {
+
+      filterComplex = [
+        `[1:v]scale=-1:iw*0.22[banner]`,
+        `[0:v][banner]overlay=(W-w)/2:${bannerY}[out]`
+      ].join(';');
+
+    } else if (!hasBanner && hasHook) {
+
+      filterComplex = [
+        `[0:v]drawtext=` +
+          `fontfile=${fontPath}:` +
+          `text='${safeHook}':` +
+          `fontcolor=white:` +
+          `fontsize=52:` +
+          `x=(w-text_w)/2:` +
+          `y=${hookY}-text_h/2:` +
+          `box=1:` +
+          `boxcolor=0x${config.hookColor}@0.92:` +
+          `boxborderw=22` +
+        `[out]`
+      ].join('');
+
     } else {
-      // صرف ٹیکسٹ
-      if (safeHook) {
-        filterComplex = `[0:v]drawtext=text='${safeHook}':fontcolor=white:fontsize=42:x=(w-text_w)/2:y=${hookY}:box=1:boxcolor=0x${config.hookColor}@0.92:boxborderw=16[out]`;
-      } else {
-        filterComplex = `[0:v]copy[out]`;
-      }
+      filterComplex = `[0:v]copy[out]`;
     }
 
-    const cmd = ffmpeg();
-    inputArgs.forEach((a, i) => {
-      if (a === '-i') return;
-      if (inputArgs[i-1] === '-i') cmd.input(a);
-    });
+    const cmd = ffmpeg(input);
+    if (hasBanner) cmd.input(bannerPath);
 
     cmd
       .complexFilter(filterComplex)
       .map('[out]')
-      .outputOptions(['-c:v libx264', '-preset fast', '-crf 23', '-c:a copy', '-movflags +faststart'])
+      .outputOptions([
+        '-c:v libx264',
+        '-preset fast',
+        '-crf 23',
+        '-c:a copy',
+        '-movflags +faststart'
+      ])
       .output(config.out)
       .on('end', resolve)
       .on('error', (err) => {
