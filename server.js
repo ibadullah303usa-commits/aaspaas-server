@@ -139,98 +139,129 @@ async function makeThreeVariants(cutPath, tmpDir, job, bannerPath) {
   return variants;
 }
 
-function applyOverlay(input, config, bannerPath) {
-  return new Promise((resolve, reject) => {
+const sharp = require('sharp');
 
-    const hookY   = config.hookPos   === 'top'    ? 'h*0.21' : 'h*0.65';
-    const bannerY = config.bannerPos === 'bottom' ? 'h*0.65' : 'h*0.21';
-
-    // Urdu text safe کریں
-    const safeHook = (config.hook || '')
-      .replace(/\\/g, '')
-      .replace(/'/g, '\u2019')
-      .replace(/:/g, '\u02D0')
-      .replace(/\[/g, '')
-      .replace(/\]/g, '')
-      .trim();
-
-    const hasBanner = bannerPath && fs.existsSync(bannerPath);
-    const hasHook   = safeHook.length > 0;
-
-    // Font path — Railway پر یہ path ہوگا
-    const fontPath = '/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf';
-
-    let filterComplex = '';
-
-    if (hasBanner && hasHook) {
-
-      filterComplex = [
-        `[1:v]scale=-1:iw*0.22[banner]`,
-        `[0:v][banner]overlay=(W-w)/2:${bannerY}[withbanner]`,
-        `[withbanner]drawtext=` +
-          `fontfile=${fontPath}:` +
-          `text='${safeHook}':` +
-          `fontcolor=white:` +
-          `fontsize=52:` +
-          `x=(w-text_w)/2:` +
-          `y=${hookY}-text_h/2:` +
-          `box=1:` +
-          `boxcolor=0x${config.hookColor}@0.92:` +
-          `boxborderw=22:` +
-          `line_spacing=8` +
-        `[out]`
-      ].join(';');
-
-    } else if (hasBanner && !hasHook) {
-
-      filterComplex = [
-        `[1:v]scale=-1:iw*0.22[banner]`,
-        `[0:v][banner]overlay=(W-w)/2:${bannerY}[out]`
-      ].join(';');
-
-    } else if (!hasBanner && hasHook) {
-
-      filterComplex = [
-        `[0:v]drawtext=` +
-          `fontfile=${fontPath}:` +
-          `text='${safeHook}':` +
-          `fontcolor=white:` +
-          `fontsize=52:` +
-          `x=(w-text_w)/2:` +
-          `y=${hookY}-text_h/2:` +
-          `box=1:` +
-          `boxcolor=0x${config.hookColor}@0.92:` +
-          `boxborderw=22` +
-        `[out]`
-      ].join('');
-
-    } else {
-      filterComplex = `[0:v]copy[out]`;
-    }
-
-    const cmd = ffmpeg(input);
-    if (hasBanner) cmd.input(bannerPath);
-
-    cmd
-      .complexFilter(filterComplex)
-      .map('[out]')
-      .outputOptions([
-        '-c:v libx264',
-        '-preset fast',
-        '-crf 23',
-        '-c:a copy',
-        '-movflags +faststart'
-      ])
-      .output(config.out)
-      .on('end', resolve)
-      .on('error', (err) => {
-        console.error('FFmpeg error:', err.message);
-        reject(err);
-      })
-      .run();
-  });
+async function createHookImage(text, bgColor, videoWidth) {
+  const fontSize = 52;
+  const paddingX = 32;
+  const paddingY = 16;
+  
+  // ہر حرف تقریباً 28px — estimate width
+  const estimatedWidth = Math.min(
+    Math.max(text.length * 30 + paddingX * 2, 200),
+    videoWidth * 0.88
+  );
+  const height = fontSize + paddingY * 2 + 10;
+  
+  // hex color parse کریں
+  const r = parseInt(bgColor.substring(0,2), 16);
+  const g = parseInt(bgColor.substring(2,4), 16);
+  const b = parseInt(bgColor.substring(4,6), 16);
+  
+  // Pill shape SVG
+  const radius = height / 2;
+  const svg = `
+    <svg width="${estimatedWidth}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <rect x="0" y="0" width="${estimatedWidth}" height="${height}" 
+            rx="${radius}" ry="${radius}" 
+            fill="rgb(${r},${g},${b})" opacity="0.93"/>
+      <text 
+        x="${estimatedWidth/2}" 
+        y="${height/2 + fontSize*0.35}"
+        font-family="Noto Naskh Arabic, Arial"
+        font-size="${fontSize}"
+        font-weight="bold"
+        fill="white"
+        text-anchor="middle"
+        direction="rtl"
+      >${text}</text>
+    </svg>`;
+  
+  return await sharp(Buffer.from(svg)).png().toBuffer();
 }
 
+function applyOverlay(input, config, bannerPath) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const tmpHookPath   = config.out.replace('.mp4', '_hook.png');
+      const tmpBannerPath = config.out.replace('.mp4', '_banner_scaled.png');
+
+      const safeHook = (config.hook || '').trim();
+
+      // 1. Hook image بنائیں
+      if (safeHook) {
+        const hookBuf = await createHookImage(safeHook, config.hookColor, 1080);
+        fs.writeFileSync(tmpHookPath, hookBuf);
+      }
+
+      // 2. Banner scale کریں
+      let scaledBannerExists = false;
+      if (bannerPath && fs.existsSync(bannerPath)) {
+        await sharp(bannerPath)
+          .resize({ width: 900, fit: 'inside' })
+          .toFile(tmpBannerPath);
+        scaledBannerExists = true;
+      }
+
+      // 3. FFmpeg — images overlay کریں
+      const hookY   = config.hookPos   === 'top'    ? 'H*0.21-h/2' : 'H*0.65-h/2';
+      const bannerY = config.bannerPos === 'bottom' ? 'H*0.65-h/2' : 'H*0.21-h/2';
+
+      const cmd = ffmpeg(input);
+      const inputs = [];
+
+      if (safeHook && fs.existsSync(tmpHookPath)) {
+        cmd.input(tmpHookPath);
+        inputs.push({ type: 'hook', y: hookY });
+      }
+      if (scaledBannerExists) {
+        cmd.input(tmpBannerPath);
+        inputs.push({ type: 'banner', y: bannerY });
+      }
+
+      let filterChain = '';
+      if (inputs.length === 0) {
+        filterChain = '[0:v]copy[out]';
+      } else if (inputs.length === 1) {
+        const i = inputs[0];
+        filterChain = `[0:v][1:v]overlay=(W-w)/2:${i.y}[out]`;
+      } else {
+        // hook اور banner دونوں
+        const first  = inputs[0];
+        const second = inputs[1];
+        filterChain = 
+          `[0:v][1:v]overlay=(W-w)/2:${first.y}[tmp];` +
+          `[tmp][2:v]overlay=(W-w)/2:${second.y}[out]`;
+      }
+
+      cmd
+        .complexFilter(filterChain)
+        .map('[out]')
+        .outputOptions([
+          '-c:v libx264',
+          '-preset fast', 
+          '-crf 23',
+          '-c:a copy',
+          '-movflags +faststart'
+        ])
+        .output(config.out)
+        .on('end', () => {
+          // temp files صاف کریں
+          if (fs.existsSync(tmpHookPath))   fs.unlinkSync(tmpHookPath);
+          if (fs.existsSync(tmpBannerPath)) fs.unlinkSync(tmpBannerPath);
+          resolve();
+        })
+        .on('error', (err) => {
+          console.error('FFmpeg error:', err.message);
+          reject(err);
+        })
+        .run();
+
+    } catch(err) {
+      reject(err);
+    }
+  });
+}
 async function uploadVariantsToBunny(variants, job) {
   const bunnyKey  = process.env.BUNNY_API_KEY;
   const bunnyZone = process.env.BUNNY_STORAGE_ZONE;
