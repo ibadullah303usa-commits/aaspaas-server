@@ -1,5 +1,5 @@
 FROM node:18
-RUN apt-get update && apt-get install -y ffmpeg
+RUN apt-get install -y ffmpeg fonts-noto-core fonts-noto-extra
 WORKDIR /app
 COPY package*.json ./
 RUN npm install
