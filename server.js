@@ -4,19 +4,16 @@ const admin = require('firebase-admin');
 const axios = require('axios');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Firebase init
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-// ==============================
-// JOB LISTENER
-// ==============================
 async function watchJobs() {
   db.collection('editing_jobs')
     .where('status', '==', 'pending')
@@ -32,39 +29,43 @@ async function watchJobs() {
     });
 }
 
-// ==============================
-// MAIN PROCESSOR
-// ==============================
 async function processJob(jobId, job) {
   const tmpDir = `/tmp/${jobId}`;
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
     await updateJob(jobId, 'processing', 10, 'ویڈیو ڈاؤن لوڈ ہو رہی ہے');
-
-    // 1. Download video
     const videoPath = `${tmpDir}/input.mp4`;
     await downloadFile(job.videoUrl, videoPath);
     await updateJob(jobId, 'processing', 25, 'کٹنگ ہو رہی ہے');
 
-    // 2. Cut video
     const cutPath = `${tmpDir}/cut.mp4`;
     await cutVideo(videoPath, cutPath, job.startTime, job.endTime);
     await updateJob(jobId, 'processing', 40, '3 ویریئنٹ بن رہے ہیں');
 
-    // 3. Make 3 variants (no music - keeps it fast and reliable)
-    const variants = await makeThreeVariants(cutPath, tmpDir, job);
+    // Banner download (if exists)
+    let bannerPath = null;
+    if (job.bannerUrl && job.bannerUrl.startsWith('data:image')) {
+      bannerPath = `${tmpDir}/banner.png`;
+      const base64Data = job.bannerUrl.replace(/^data:image\/\w+;base64,/, '');
+      fs.writeFileSync(bannerPath, Buffer.from(base64Data, 'base64'));
+    } else if (job.bannerUrl && job.bannerUrl.startsWith('http')) {
+      bannerPath = `${tmpDir}/banner.png`;
+      await downloadFile(job.bannerUrl, bannerPath);
+    }
+
+    const variants = await makeThreeVariants(cutPath, tmpDir, job, bannerPath);
     await updateJob(jobId, 'processing', 80, 'Bunny پر اپلوڈ ہو رہا ہے');
 
-    // 4. Upload to Bunny
     const urls = await uploadVariantsToBunny(variants, job);
     await updateJob(jobId, 'processing', 92, 'Firebase میں محفوظ ہو رہا ہے');
 
-    // 5. Save to feed
     await saveToFeed(urls, job);
-    await updateJob(jobId, 'done', 100, 'مکمل ✓');
 
-    // 6. Cleanup
+    // ✅ job مکمل ہونے پر editing_jobs سے ڈیلیٹ کریں
+    await updateJob(jobId, 'done', 100, 'مکمل ✓');
+    await db.collection('editing_jobs').doc(jobId).delete();
+
     fs.rmSync(tmpDir, { recursive: true, force: true });
 
   } catch (err) {
@@ -74,9 +75,6 @@ async function processJob(jobId, job) {
   }
 }
 
-// ==============================
-// HELPERS
-// ==============================
 async function updateJob(jobId, status, progress, message) {
   await db.collection('editing_jobs').doc(jobId).update({
     status, progress, message,
@@ -86,7 +84,7 @@ async function updateJob(jobId, status, progress, message) {
 
 function downloadFile(url, dest) {
   return new Promise(async (resolve, reject) => {
-    const res = await axios({ url, method:'GET', responseType:'stream', timeout: 60000 });
+    const res = await axios({ url, method: 'GET', responseType: 'stream', timeout: 60000 });
     const writer = fs.createWriteStream(dest);
     res.data.pipe(writer);
     writer.on('finish', resolve);
@@ -109,68 +107,90 @@ function cutVideo(input, output, start, end) {
   });
 }
 
-async function makeThreeVariants(cutPath, tmpDir, job) {
-  // Read admin editing config from Firebase (optional)
-  let adminConfig = {};
-  try {
-    const cfgSnap = await db.collection('marketing_settings').doc('editing_config').get();
-    if (cfgSnap.exists) adminConfig = cfgSnap.data();
-  } catch(e) { console.log('No admin editing config, using defaults'); }
-
-  const configs = [
+// ✅ تینوں ویریئنٹ — صرف overlay، کوئی zoom/filter/music نہیں
+async function makeThreeVariants(cutPath, tmpDir, job, bannerPath) {
+  const variants = [
     {
       out: `${tmpDir}/v1.mp4`,
-      zoom: adminConfig.v1Zoom || '1.05',
-      filter: adminConfig.v1Filter || 'curves=vintage',
-      hook: job.hook1,
-      hookPos: 'top',
-      bannerPos: 'bottom'
+      hook: job.hook1 || '',
+      hookPos: 'top',     // h*0.21
+      hookColor: 'f97316', // نارنجی
+      bannerPos: 'bottom'  // h*0.65
     },
     {
       out: `${tmpDir}/v2.mp4`,
-      zoom: adminConfig.v2Zoom || '1.08',
-      filter: adminConfig.v2Filter || 'hue=s=1.2',
-      hook: job.hook2,
+      hook: job.hook2 || '',
       hookPos: 'top',
+      hookColor: 'dc2626', // لال
       bannerPos: 'bottom'
     },
     {
       out: `${tmpDir}/v3.mp4`,
-      zoom: adminConfig.v3Zoom || '1.03',
-      filter: adminConfig.v3Filter || 'colorchannelmixer=.3:.4:.3:0:.3:.4:.3:0:.3:.4:.3',
-      hook: job.hook3,
-      hookPos: 'bottom',
-      bannerPos: 'top'
-    },
+      hook: job.hook3 || '',
+      hookPos: 'bottom',   // h*0.65
+      hookColor: '2563eb', // نیلا
+      bannerPos: 'top'     // h*0.21
+    }
   ];
 
-  const results = [];
-  for (const c of configs) {
-    console.log('Making variant:', c.out);
-    await applyVariantFilter(cutPath, c, job, tmpDir);
-    results.push(c);
+  for (const v of variants) {
+    await applyOverlay(cutPath, v, bannerPath);
   }
-  return results;
+  return variants;
 }
 
-function applyVariantFilter(input, config, job, tmpDir) {
+function applyOverlay(input, config, bannerPath) {
   return new Promise((resolve, reject) => {
-    const hookY    = config.hookPos    === 'top' ? 'h*0.21' : 'h*0.65';
-    const hookText = (config.hook || '').replace(/\\/g, '\\\\').replace(/'/g, "\u2019").replace(/:/g, '\\:');
+    const hookY = config.hookPos === 'top' ? 'h*0.21' : 'h*0.65';
+    const bannerY = config.bannerPos === 'bottom' ? 'h*0.65' : 'h*0.21';
 
-    let vf = `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z=${config.zoom}:d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',${config.filter}`;
+    // ✅ ٹیکسٹ کو FFmpeg safe بنائیں
+    const safeHook = (config.hook || '')
+      .replace(/\\/g, '')
+      .replace(/'/g, '\u2019')
+      .replace(/:/g, '\u02D0')
+      .replace(/\[/g, '(')
+      .replace(/\]/g, ')')
+      .trim();
 
-    if (hookText) {
-      vf += `,drawtext=text='${hookText}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=${hookY}:box=1:boxcolor=0xff6600@0.85:boxborderw=12`;
+    let filterComplex = '';
+    let inputArgs = ['-i', input];
+
+    if (bannerPath && fs.existsSync(bannerPath)) {
+      // بینر اور ٹیکسٹ دونوں
+      inputArgs = ['-i', input, '-i', bannerPath];
+
+      const bannerScale = `[1:v]scale=iw*min(1080/iw\\,1920*0.28/ih):ih*min(1080/iw\\,1920*0.28/ih)[banner]`;
+      const overlayBanner = `[0:v][banner]overlay=(W-w)/2:${bannerY}[withbanner]`;
+
+      if (safeHook) {
+        filterComplex = `${bannerScale};${overlayBanner};[withbanner]drawtext=text='${safeHook}':fontcolor=white:fontsize=42:x=(w-text_w)/2:y=${hookY}:box=1:boxcolor=0x${config.hookColor}@0.92:boxborderw=16[out]`;
+      } else {
+        filterComplex = `${bannerScale};${overlayBanner}[out]`;
+      }
+    } else {
+      // صرف ٹیکسٹ
+      if (safeHook) {
+        filterComplex = `[0:v]drawtext=text='${safeHook}':fontcolor=white:fontsize=42:x=(w-text_w)/2:y=${hookY}:box=1:boxcolor=0x${config.hookColor}@0.92:boxborderw=16[out]`;
+      } else {
+        filterComplex = `[0:v]copy[out]`;
+      }
     }
 
-    ffmpeg(input)
-      .videoFilter(vf)
+    const cmd = ffmpeg();
+    inputArgs.forEach((a, i) => {
+      if (a === '-i') return;
+      if (inputArgs[i-1] === '-i') cmd.input(a);
+    });
+
+    cmd
+      .complexFilter(filterComplex)
+      .map('[out]')
       .outputOptions(['-c:v libx264', '-preset fast', '-crf 23', '-c:a copy', '-movflags +faststart'])
       .output(config.out)
       .on('end', resolve)
       .on('error', (err) => {
-        console.error('FFmpeg error for', config.out, err.message);
+        console.error('FFmpeg error:', err.message);
         reject(err);
       })
       .run();
@@ -199,17 +219,16 @@ async function uploadVariantsToBunny(variants, job) {
       url: `${bunnyCdn}/${filename}`,
       hook: v.hook,
       hookPos: v.hookPos,
-      bannerPos: v.bannerPos
+      bannerPos: v.bannerPos,
+      hookColor: v.hookColor
     });
-
-    console.log('Uploaded variant', i+1, filename);
   }
   return urls;
 }
 
 async function saveToFeed(urls, job) {
   const uid = Date.now();
-  const hookClasses = ['hook-v1','hook-v2','hook-v3'];
+  const hookClasses = ['hook-v1', 'hook-v2', 'hook-v3'];
 
   for (let i = 0; i < urls.length; i++) {
     const u = urls[i];
@@ -228,9 +247,6 @@ async function saveToFeed(urls, job) {
   }
 }
 
-// ==============================
-// START
-// ==============================
 app.get('/', (req, res) => res.send('Aaspaas Server Running ✓'));
 watchJobs();
 app.listen(3000, () => console.log('Server on port 3000'));
