@@ -1,5 +1,8 @@
 FROM node:18
-RUN apt-get install -y ffmpeg fonts-noto-core fonts-noto-extra
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    fonts-noto-core \
+    libvips-dev
 WORKDIR /app
 COPY package*.json ./
 RUN npm install
