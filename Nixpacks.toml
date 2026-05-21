@@ -1,20 +1,16 @@
-# Railway ke liye nixpacks config
-# Urdu/Arabic font server par install karta hai
-
+cat > /mnt/user-data/outputs/nixpacks.toml << 'EOF'
 [phases.setup]
-nixPkgs = [
-  "nodejs",
-  "nodePackages.npm",
-  "fontconfig",
-  "noto-fonts",
-  "noto-fonts-extra"
-]
+nixPkgs = ["nodejs", "nodePackages.npm", "ffmpeg", "fontconfig"]
 
 [phases.build]
 cmds = [
   "npm install",
+  "mkdir -p /usr/share/fonts/truetype/jameel",
+  "cp 'Jameel Noori Nastaleeq Kasheeda - [UrduFonts.com].ttf' /usr/share/fonts/truetype/jameel/JameelNoori.ttf",
   "fc-cache -fv"
 ]
 
 [start]
 cmd = "node server.js"
+EOF
+echo "done"
