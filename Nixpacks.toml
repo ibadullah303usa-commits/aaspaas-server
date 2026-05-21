@@ -11,3 +11,8 @@ cmds = [
 
 [start]
 cmd = "node server.js"
+[phases.build]
+cmds = [
+  "npm install",
+  "mkdir -p /usr/share/fonts/truetype/jameel && cp JameelNoori.ttf /usr/share/fonts/truetype/jameel/ && fc-cache -fv"
+]
