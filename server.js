@@ -5,6 +5,8 @@ const axios = require('axios');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const path = require('path');
+const { createCanvas, registerFont } = require('canvas');
+const sharp = require('sharp');
 
 const app = express();
 app.use(cors());
@@ -14,6 +16,38 @@ const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
+// ============================================================
+// FONT SETUP — Noto Naskh Arabic (Urdu ke liye server par)
+// Railway par font install karne ka tarika:
+//   nixpacks.toml mein:  [phases.setup] nixPkgs = ["fonts-noto"]
+//   YA Dockerfile mein:  RUN apt-get install -y fonts-noto-core
+// ============================================================
+const FONT_PATHS = [
+  '/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf',
+  '/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf',
+  '/usr/share/fonts/opentype/noto/NotoNaskhArabic-Bold.ttf',
+  '/root/.fonts/NotoNaskhArabic-Bold.ttf',
+  '/app/fonts/NotoNaskhArabic-Bold.ttf',
+];
+
+let FONT_FAMILY = 'Arial'; // fallback
+
+for (const fp of FONT_PATHS) {
+  if (fs.existsSync(fp)) {
+    try {
+      registerFont(fp, { family: 'UrduFont', weight: 'bold' });
+      FONT_FAMILY = 'UrduFont';
+      console.log('✓ Urdu font loaded:', fp);
+      break;
+    } catch (e) {
+      console.log('Font load failed:', fp, e.message);
+    }
+  }
+}
+
+// ============================================================
+// WATCH JOBS
+// ============================================================
 async function watchJobs() {
   db.collection('editing_jobs')
     .where('status', '==', 'pending')
@@ -22,13 +56,16 @@ async function watchJobs() {
         if (change.type === 'added') {
           const jobId = change.doc.id;
           const job   = change.doc.data();
-          console.log('New job:', jobId);
+          console.log('✓ New job:', jobId);
           await processJob(jobId, job);
         }
       });
     });
 }
 
+// ============================================================
+// PROCESS JOB
+// ============================================================
 async function processJob(jobId, job) {
   const tmpDir = `/tmp/${jobId}`;
   fs.mkdirSync(tmpDir, { recursive: true });
@@ -37,13 +74,14 @@ async function processJob(jobId, job) {
     await updateJob(jobId, 'processing', 10, 'ویڈیو ڈاؤن لوڈ ہو رہی ہے');
     const videoPath = `${tmpDir}/input.mp4`;
     await downloadFile(job.videoUrl, videoPath);
-    await updateJob(jobId, 'processing', 25, 'کٹنگ ہو رہی ہے');
 
+    await updateJob(jobId, 'processing', 25, 'کٹنگ ہو رہی ہے');
     const cutPath = `${tmpDir}/cut.mp4`;
     await cutVideo(videoPath, cutPath, job.startTime, job.endTime);
+
     await updateJob(jobId, 'processing', 40, '3 ویریئنٹ بن رہے ہیں');
 
-    // Banner download (if exists)
+    // Banner download
     let bannerPath = null;
     if (job.bannerUrl && job.bannerUrl.startsWith('data:image')) {
       bannerPath = `${tmpDir}/banner.png`;
@@ -54,41 +92,46 @@ async function processJob(jobId, job) {
       await downloadFile(job.bannerUrl, bannerPath);
     }
 
+    // 3 variants banayein
     const variants = await makeThreeVariants(cutPath, tmpDir, job, bannerPath);
+
     await updateJob(jobId, 'processing', 80, 'Bunny پر اپلوڈ ہو رہا ہے');
-
     const urls = await uploadVariantsToBunny(variants, job);
-    await updateJob(jobId, 'processing', 92, 'Firebase میں محفوظ ہو رہا ہے');
 
+    await updateJob(jobId, 'processing', 92, 'Firebase میں محفوظ ہو رہا ہے');
     await saveToFeed(urls, job);
 
-    // ✅ job مکمل ہونے پر editing_jobs سے ڈیلیٹ کریں
     await updateJob(jobId, 'done', 100, 'مکمل ✓');
-    await db.collection('editing_jobs').doc(jobId).delete();
 
+    // Cleanup
     fs.rmSync(tmpDir, { recursive: true, force: true });
 
   } catch (err) {
-    console.error(err);
+    console.error('Job error:', err);
     await updateJob(jobId, 'error', 0, 'خرابی: ' + err.message);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
 async function updateJob(jobId, status, progress, message) {
-  await db.collection('editing_jobs').doc(jobId).update({
-    status, progress, message,
-    updatedAt: Date.now()
-  });
+  try {
+    await db.collection('editing_jobs').doc(jobId).update({
+      status, progress, message, updatedAt: Date.now()
+    });
+  } catch (e) {
+    // job already deleted — ignore
+  }
 }
 
 function downloadFile(url, dest) {
   return new Promise(async (resolve, reject) => {
-    const res = await axios({ url, method: 'GET', responseType: 'stream', timeout: 60000 });
-    const writer = fs.createWriteStream(dest);
-    res.data.pipe(writer);
-    writer.on('finish', resolve);
-    writer.on('error', reject);
+    try {
+      const res = await axios({ url, method: 'GET', responseType: 'stream', timeout: 120000 });
+      const writer = fs.createWriteStream(dest);
+      res.data.pipe(writer);
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+    } catch (e) { reject(e); }
   });
 }
 
@@ -107,29 +150,34 @@ function cutVideo(input, output, start, end) {
   });
 }
 
-// ✅ تینوں ویریئنٹ — صرف overlay، کوئی zoom/filter/music نہیں
+// ============================================================
+// 3 VARIANTS CONFIG — prompt ke mutabiq
+// V1: Red  (#FF0000) — hook top 21%,    banner bottom 65%
+// V2: Blue (#0066FF) — hook top 21%,    banner bottom 65%
+// V3: Purple (#8A2BE2) — hook bottom 65%, banner top 21%
+// ============================================================
 async function makeThreeVariants(cutPath, tmpDir, job, bannerPath) {
   const variants = [
     {
-      out: `${tmpDir}/v1.mp4`,
-      hook: job.hook1 || '',
-      hookPos: 'top',     // h*0.21
-      hookColor: 'f97316', // نارنجی
-      bannerPos: 'bottom'  // h*0.65
+      out:        `${tmpDir}/v1.mp4`,
+      hook:       job.hook1 || '',
+      hookColor:  '#FF0000',   // Solid Red
+      hookPos:    'top',       // 21%
+      bannerPos:  'bottom',    // 65%
     },
     {
-      out: `${tmpDir}/v2.mp4`,
-      hook: job.hook2 || '',
-      hookPos: 'top',
-      hookColor: 'dc2626', // لال
-      bannerPos: 'bottom'
+      out:        `${tmpDir}/v2.mp4`,
+      hook:       job.hook2 || '',
+      hookColor:  '#0066FF',   // Solid Blue
+      hookPos:    'top',       // 21%
+      bannerPos:  'bottom',    // 65%
     },
     {
-      out: `${tmpDir}/v3.mp4`,
-      hook: job.hook3 || '',
-      hookPos: 'bottom',   // h*0.65
-      hookColor: '2563eb', // نیلا
-      bannerPos: 'top'     // h*0.21
+      out:        `${tmpDir}/v3.mp4`,
+      hook:       job.hook3 || '',
+      hookColor:  '#8A2BE2',   // Solid Purple
+      hookPos:    'bottom',    // 65%
+      bannerPos:  'top',       // 21%
     }
   ];
 
@@ -139,47 +187,100 @@ async function makeThreeVariants(cutPath, tmpDir, job, bannerPath) {
   return variants;
 }
 
-const sharp = require('sharp');
+// ============================================================
+// CREATE HOOK IMAGE — Canvas se pill shape, Urdu text
+// ============================================================
+async function createHookImage(text, bgColorHex, videoWidth = 1080) {
+  if (!text || !text.trim()) return null;
 
-async function createHookImage(text, bgColor, videoWidth) {
-  const fontSize = 52;
-  const paddingX = 32;
-  const paddingY = 16;
-  
-  // ہر حرف تقریباً 28px — estimate width
-  const estimatedWidth = Math.min(
-    Math.max(text.length * 30 + paddingX * 2, 200),
-    videoWidth * 0.88
-  );
-  const height = fontSize + paddingY * 2 + 10;
-  
-  // hex color parse کریں
-  const r = parseInt(bgColor.substring(0,2), 16);
-  const g = parseInt(bgColor.substring(2,4), 16);
-  const b = parseInt(bgColor.substring(4,6), 16);
-  
-  // Pill shape SVG
-  const radius = height / 2;
-  const svg = `
-    <svg width="${estimatedWidth}" height="${height}" xmlns="http://www.w3.org/2000/svg">
-      <rect x="0" y="0" width="${estimatedWidth}" height="${height}" 
-            rx="${radius}" ry="${radius}" 
-            fill="rgb(${r},${g},${b})" opacity="0.93"/>
-      <text 
-        x="${estimatedWidth/2}" 
-        y="${height/2 + fontSize*0.35}"
-        font-family="Noto Naskh Arabic, Arial"
-        font-size="${fontSize}"
-        font-weight="bold"
-        fill="white"
-        text-anchor="middle"
-        direction="rtl"
-      >${text}</text>
-    </svg>`;
-  
-  return await sharp(Buffer.from(svg)).png().toBuffer();
+  const MAX_WIDTH    = Math.floor(videoWidth * 0.82); // 82% of screen
+  const PADDING_X    = 36;
+  const FONT_SIZE    = 54;
+  const LINE_HEIGHT  = FONT_SIZE * 1.5;
+  const PILL_HEIGHT  = Math.floor(LINE_HEIGHT + 20); // tight wrap
+  const BORDER_RAD   = PILL_HEIGHT / 2;
+
+  // Canvas measure karo — text width ke liye
+  const measureCanvas = createCanvas(MAX_WIDTH * 2, PILL_HEIGHT * 2);
+  const mCtx = measureCanvas.getContext('2d');
+  mCtx.font = `bold ${FONT_SIZE}px "${FONT_FAMILY}"`;
+
+  const measured = mCtx.measureText(text).width;
+  // Auto-adjust: agar text bada ho to font chhota karo
+  let finalFontSize = FONT_SIZE;
+  let finalWidth = Math.min(measured + PADDING_X * 2, MAX_WIDTH);
+
+  if (measured + PADDING_X * 2 > MAX_WIDTH) {
+    // Font shrink karo proportionally
+    const ratio = (MAX_WIDTH - PADDING_X * 2) / measured;
+    finalFontSize = Math.max(Math.floor(FONT_SIZE * ratio), 28);
+    mCtx.font = `bold ${finalFontSize}px "${FONT_FAMILY}"`;
+    const remeasured = mCtx.measureText(text).width;
+    finalWidth = Math.min(remeasured + PADDING_X * 2, MAX_WIDTH);
+  }
+
+  const finalHeight = Math.floor(finalFontSize * 1.6 + 18);
+  const finalRadius = finalHeight / 2;
+
+  // Actual canvas
+  const canvas = createCanvas(finalWidth, finalHeight);
+  const ctx = canvas.getContext('2d');
+
+  // Background: pill shape with glossy gradient
+  ctx.clearRect(0, 0, finalWidth, finalHeight);
+
+  // Parse hex color
+  const r = parseInt(bgColorHex.slice(1, 3), 16);
+  const g = parseInt(bgColorHex.slice(3, 5), 16);
+  const b = parseInt(bgColorHex.slice(5, 7), 16);
+
+  // Glossy gradient — top lighter, bottom solid
+  const grad = ctx.createLinearGradient(0, 0, 0, finalHeight);
+  grad.addColorStop(0,   `rgba(${r+40},${g+40},${b+40},0.97)`);
+  grad.addColorStop(0.5, `rgba(${r},${g},${b},0.95)`);
+  grad.addColorStop(1,   `rgba(${Math.max(r-20,0)},${Math.max(g-20,0)},${Math.max(b-20,0)},0.98)`);
+
+  // Draw pill
+  ctx.beginPath();
+  ctx.moveTo(finalRadius, 0);
+  ctx.arcTo(finalWidth, 0, finalWidth, finalHeight, finalRadius);
+  ctx.arcTo(finalWidth, finalHeight, 0, finalHeight, finalRadius);
+  ctx.arcTo(0, finalHeight, 0, 0, finalRadius);
+  ctx.arcTo(0, 0, finalWidth, 0, finalRadius);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Subtle inner glow on top edge
+  const gloss = ctx.createLinearGradient(0, 0, 0, finalHeight * 0.5);
+  gloss.addColorStop(0, 'rgba(255,255,255,0.18)');
+  gloss.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = gloss;
+  ctx.fill();
+
+  // Text shadow
+  ctx.shadowColor   = 'rgba(0,0,0,0.65)';
+  ctx.shadowBlur    = 8;
+  ctx.shadowOffsetX = 0;
+  ctx.shadowOffsetY = 2;
+
+  // Text
+  ctx.font      = `bold ${finalFontSize}px "${FONT_FAMILY}"`;
+  ctx.fillStyle = '#FFFFFF';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.direction    = 'rtl';
+
+  // Slight vertical overflow effect — text center slightly above midpoint
+  const textY = finalHeight * 0.50;
+  ctx.fillText(text, finalWidth / 2, textY);
+
+  return canvas.toBuffer('image/png');
 }
 
+// ============================================================
+// APPLY OVERLAY — FFmpeg se hook + banner lagao
+// ============================================================
 function applyOverlay(input, config, bannerPath) {
   return new Promise(async (resolve, reject) => {
     try {
@@ -188,50 +289,57 @@ function applyOverlay(input, config, bannerPath) {
 
       const safeHook = (config.hook || '').trim();
 
-      // 1. Hook image بنائیں
+      // 1. Hook image banao
+      let hookExists = false;
       if (safeHook) {
         const hookBuf = await createHookImage(safeHook, config.hookColor, 1080);
-        fs.writeFileSync(tmpHookPath, hookBuf);
+        if (hookBuf) {
+          fs.writeFileSync(tmpHookPath, hookBuf);
+          hookExists = true;
+        }
       }
 
-      // 2. Banner scale کریں
-      let scaledBannerExists = false;
+      // 2. Banner scale karo
+      let bannerExists = false;
       if (bannerPath && fs.existsSync(bannerPath)) {
         await sharp(bannerPath)
           .resize({ width: 900, fit: 'inside' })
+          .png()
           .toFile(tmpBannerPath);
-        scaledBannerExists = true;
+        bannerExists = true;
       }
 
-      // 3. FFmpeg — images overlay کریں
-      const hookY   = config.hookPos   === 'top'    ? 'H*0.21-h/2' : 'H*0.65-h/2';
-      const bannerY = config.bannerPos === 'bottom' ? 'H*0.65-h/2' : 'H*0.21-h/2';
+      // 3. FFmpeg overlay positions
+      // hookPos  'top'    => H*0.21 - h/2  (centered at 21%)
+      // hookPos  'bottom' => H*0.65 - h/2  (centered at 65%)
+      // bannerPos same logic
+      const hookY   = config.hookPos   === 'top'
+        ? '(H*0.21)-(h/2)'
+        : '(H*0.65)-(h/2)';
+      const bannerY = config.bannerPos === 'top'
+        ? '(H*0.21)-(h/2)'
+        : '(H*0.65)-(h/2)';
 
+      // Inputs list
+      const inputsList = [];
+      if (hookExists)   inputsList.push({ path: tmpHookPath,   y: hookY });
+      if (bannerExists) inputsList.push({ path: tmpBannerPath, y: bannerY });
+
+      // FFmpeg command build karo
       const cmd = ffmpeg(input);
-      const inputs = [];
-
-      if (safeHook && fs.existsSync(tmpHookPath)) {
-        cmd.input(tmpHookPath);
-        inputs.push({ type: 'hook', y: hookY });
-      }
-      if (scaledBannerExists) {
-        cmd.input(tmpBannerPath);
-        inputs.push({ type: 'banner', y: bannerY });
-      }
+      inputsList.forEach(inp => cmd.input(inp.path));
 
       let filterChain = '';
-      if (inputs.length === 0) {
+      if (inputsList.length === 0) {
+        // Koi overlay nahi — seedha copy karo
         filterChain = '[0:v]copy[out]';
-      } else if (inputs.length === 1) {
-        const i = inputs[0];
-        filterChain = `[0:v][1:v]overlay=(W-w)/2:${i.y}[out]`;
+      } else if (inputsList.length === 1) {
+        filterChain = `[0:v][1:v]overlay=(W-w)/2:${inputsList[0].y}[out]`;
       } else {
-        // hook اور banner دونوں
-        const first  = inputs[0];
-        const second = inputs[1];
-        filterChain = 
-          `[0:v][1:v]overlay=(W-w)/2:${first.y}[tmp];` +
-          `[tmp][2:v]overlay=(W-w)/2:${second.y}[out]`;
+        // 2 overlays — hook pehle, banner baad mein
+        filterChain =
+          `[0:v][1:v]overlay=(W-w)/2:${inputsList[0].y}[tmp];` +
+          `[tmp][2:v]overlay=(W-w)/2:${inputsList[1].y}[out]`;
       }
 
       cmd
@@ -239,14 +347,13 @@ function applyOverlay(input, config, bannerPath) {
         .map('[out]')
         .outputOptions([
           '-c:v libx264',
-          '-preset fast', 
+          '-preset fast',
           '-crf 23',
           '-c:a copy',
           '-movflags +faststart'
         ])
         .output(config.out)
         .on('end', () => {
-          // temp files صاف کریں
           if (fs.existsSync(tmpHookPath))   fs.unlinkSync(tmpHookPath);
           if (fs.existsSync(tmpBannerPath)) fs.unlinkSync(tmpBannerPath);
           resolve();
@@ -257,11 +364,15 @@ function applyOverlay(input, config, bannerPath) {
         })
         .run();
 
-    } catch(err) {
+    } catch (err) {
       reject(err);
     }
   });
 }
+
+// ============================================================
+// BUNNY UPLOAD
+// ============================================================
 async function uploadVariantsToBunny(variants, job) {
   const bunnyKey  = process.env.BUNNY_API_KEY;
   const bunnyZone = process.env.BUNNY_STORAGE_ZONE;
@@ -270,20 +381,23 @@ async function uploadVariantsToBunny(variants, job) {
   const urls = [];
 
   for (let i = 0; i < variants.length; i++) {
-    const v = variants[i];
-    const filename = `edited_${Date.now()}_v${i+1}.mp4`;
-    const fileBuffer = fs.readFileSync(v.out);
+    const v        = variants[i];
+    const filename = `edited_${Date.now()}_v${i + 1}.mp4`;
+    const fileBuf  = fs.readFileSync(v.out);
 
     await axios.put(
       `https://${bunnyHost}/${bunnyZone}/${filename}`,
-      fileBuffer,
-      { headers: { AccessKey: bunnyKey, 'Content-Type': 'video/mp4' }, maxBodyLength: Infinity }
+      fileBuf,
+      {
+        headers: { AccessKey: bunnyKey, 'Content-Type': 'video/mp4' },
+        maxBodyLength: Infinity
+      }
     );
 
     urls.push({
-      url: `${bunnyCdn}/${filename}`,
-      hook: v.hook,
-      hookPos: v.hookPos,
+      url:       `${bunnyCdn}/${filename}`,
+      hook:      v.hook,
+      hookPos:   v.hookPos,
       bannerPos: v.bannerPos,
       hookColor: v.hookColor
     });
@@ -291,27 +405,40 @@ async function uploadVariantsToBunny(variants, job) {
   return urls;
 }
 
+// ============================================================
+// SAVE TO FEED — prompt ke mutabiq classes
+// ============================================================
 async function saveToFeed(urls, job) {
   const uid = Date.now();
-  const hookClasses = ['hook-v1', 'hook-v2', 'hook-v3'];
+
+  // hook-v1 = Red, hook-v2 = Blue, hook-v3 = Purple
+  const hookClasses   = ['hook-v1', 'hook-v2', 'hook-v3'];
+  // Variant 1 & 2: hook top, banner bottom
+  // Variant 3: hook bottom, banner top
+  const textClasses   = ['hook-top', 'hook-top', 'hook-bottom'];
+  const bannerClasses = ['banner-bottom', 'banner-bottom', 'banner-top'];
 
   for (let i = 0; i < urls.length; i++) {
     const u = urls[i];
     await db.collection('marketing_feed').add({
-      id: `sv${i+1}_${uid}`,
-      mediaUrl: u.url,
-      mediaType: 'video',
-      hookText: u.hook || '',
-      caption: job.captions ? (job.captions[i] || '') : '',
-      bannerUrl: job.bannerUrl || '',
-      textPositionClass: `hook-${u.hookPos} ${hookClasses[i]}`,
-      bannerPositionClass: `banner-${u.bannerPos}`,
-      timestamp: uid - i,
-      extCaps: job.extCaps || {}
+      id:                  `sv${i + 1}_${uid}`,
+      mediaUrl:            u.url,
+      mediaType:           'video',
+      hookText:            u.hook || '',
+      caption:             job.captions ? (job.captions[i] || '') : '',
+      bannerUrl:           job.bannerUrl || '',
+      // User HTML mein: hook-top hook-v1 etc.
+      textPositionClass:   `${textClasses[i]} ${hookClasses[i]}`,
+      bannerPositionClass: bannerClasses[i],
+      timestamp:           uid - i,
+      extCaps:             job.extCaps || {}
     });
   }
 }
 
+// ============================================================
+// SERVER START
+// ============================================================
 app.get('/', (req, res) => res.send('Aaspaas Server Running ✓'));
 watchJobs();
 app.listen(3000, () => console.log('Server on port 3000'));
