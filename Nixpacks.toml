@@ -1,0 +1,20 @@
+# Railway ke liye nixpacks config
+# Urdu/Arabic font server par install karta hai
+
+[phases.setup]
+nixPkgs = [
+  "nodejs",
+  "nodePackages.npm",
+  "fontconfig",
+  "noto-fonts",
+  "noto-fonts-extra"
+]
+
+[phases.build]
+cmds = [
+  "npm install",
+  "fc-cache -fv"
+]
+
+[start]
+cmd = "node server.js"
