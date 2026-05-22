@@ -126,27 +126,23 @@ async function updateJob(jobId, status, progress, message) {
 function downloadFile(url, dest) {
   return new Promise(async (resolve, reject) => {
     try {
-      const res = await axios({ url, method: 'GET', responseType: 'stream', timeout: 120000 });
+      const res = await axios({ 
+        url, 
+        method: 'GET', 
+        responseType: 'stream', 
+        timeout: 120000,
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      });
       const writer = fs.createWriteStream(dest);
       res.data.pipe(writer);
-      writer.on('finish', resolve);
+      writer.on('finish', () => {
+        const size = fs.statSync(dest).size;
+        console.log(`Downloaded: ${dest} — ${size} bytes`);
+        if (size < 1000) return reject(new Error('Downloaded file too small: ' + size));
+        resolve();
+      });
       writer.on('error', reject);
     } catch (e) { reject(e); }
-  });
-}
-
-function cutVideo(input, output, start, end) {
-  const startSec = parseFloat(start) || 0;
-  const endSec   = parseFloat(end)   || 15;
-  const duration = Math.max(endSec - startSec, 1);
-  return new Promise((resolve, reject) => {
-    ffmpeg(input)
-      .setStartTime(startSec)
-      .setDuration(duration)
-      .output(output)
-      .on('end', resolve)
-      .on('error', reject)
-      .run();
   });
 }
 
