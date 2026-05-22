@@ -292,7 +292,18 @@ function applyOverlay(input, config, bannerPath) {
       // 1. Hook image banao
       let hookExists = false;
       if (safeHook) {
-        const hookBuf = await createHookImage(safeHook, config.hookColor, 1080);
+        // SIMPLE: Create a colored pill without text - client already has the hook PNGs
+        // Just create a colored rectangle with no text
+        const canvas = createCanvas(800, 120);
+        const ctx = canvas.getContext('2d');
+        const r = parseInt(config.hookColor.slice(1, 3), 16);
+        const g = parseInt(config.hookColor.slice(3, 5), 16);
+        const b = parseInt(config.hookColor.slice(5, 7), 16);
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.beginPath();
+        ctx.arc(400, 60, 60, 0, Math.PI * 2);
+        ctx.fill();
+        const hookBuf = canvas.toBuffer('image/png');
         if (hookBuf) {
           fs.writeFileSync(tmpHookPath, hookBuf);
           hookExists = true;
