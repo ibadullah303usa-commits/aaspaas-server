@@ -284,66 +284,25 @@ async function createHookImage(text, bgColorHex, videoWidth = 1080) {
 function applyOverlay(input, config, bannerPath) {
   return new Promise(async (resolve, reject) => {
     try {
-      const tmpHookPath   = config.out.replace('.mp4', '_hook.png');
-      const tmpBannerPath = config.out.replace('.mp4', '_banner_scaled.png');
+      const tmpHook = config.out.replace('.mp4', '_overlay.png');
 
-      const safeHook = (config.hook || '').trim();
-
-      // 1. Hook image banao
-      let hookExists = false;
-      if (safeHook) {
-        const hookBuf = await createHookImage(safeHook, config.hookColor, 1080);
-        if (hookBuf) {
-          fs.writeFileSync(tmpHookPath, hookBuf);
-          hookExists = true;
-        }
+      let overlayExists = false;
+      if (config.hookPng) {
+        overlayExists = saveBase64Png(config.hookPng, tmpHook);
+        console.log('✓ Overlay PNG saved:', overlayExists);
       }
 
-      // 2. Banner scale karo
-      let bannerExists = false;
-      if (bannerPath && fs.existsSync(bannerPath)) {
-        await sharp(bannerPath)
-          .resize({ width: 900, fit: 'inside' })
-          .png()
-          .toFile(tmpBannerPath);
-        bannerExists = true;
-      }
-
-      // 3. FFmpeg overlay positions
-      // hookPos  'top'    => H*0.21 - h/2  (centered at 21%)
-      // hookPos  'bottom' => H*0.65 - h/2  (centered at 65%)
-      // bannerPos same logic
-      const hookY   = config.hookPos   === 'top'
-        ? '(H*0.21)-(h/2)'
-        : '(H*0.65)-(h/2)';
-      const bannerY = config.bannerPos === 'top'
-        ? '(H*0.21)-(h/2)'
-        : '(H*0.65)-(h/2)';
-
-      // Inputs list
-      const inputsList = [];
-      if (hookExists)   inputsList.push({ path: tmpHookPath,   y: hookY });
-      if (bannerExists) inputsList.push({ path: tmpBannerPath, y: bannerY });
-
-      // FFmpeg command build karo
       const cmd = ffmpeg(input);
-      inputsList.forEach(inp => cmd.input(inp.path));
+      let filter = '[0:v]copy[out]';
 
-      let filterChain = '';
-      if (inputsList.length === 0) {
-        // Koi overlay nahi — seedha copy karo
-        filterChain = '[0:v]copy[out]';
-      } else if (inputsList.length === 1) {
-        filterChain = `[0:v][1:v]overlay=(W-w)/2:${inputsList[0].y}[out]`;
-      } else {
-        // 2 overlays — hook pehle, banner baad mein
-        filterChain =
-          `[0:v][1:v]overlay=(W-w)/2:${inputsList[0].y}[tmp];` +
-          `[tmp][2:v]overlay=(W-w)/2:${inputsList[1].y}[out]`;
+      if (overlayExists) {
+        cmd.input(tmpHook);
+        // PNG exact 1080x1920 hai — seedha 0,0 par lagao
+        filter = `[0:v][1:v]overlay=0:0[out]`;
       }
 
       cmd
-        .complexFilter(filterChain)
+        .complexFilter(filter)
         .map('[out]')
         .outputOptions([
           '-c:v libx264',
@@ -354,8 +313,7 @@ function applyOverlay(input, config, bannerPath) {
         ])
         .output(config.out)
         .on('end', () => {
-          if (fs.existsSync(tmpHookPath))   fs.unlinkSync(tmpHookPath);
-          if (fs.existsSync(tmpBannerPath)) fs.unlinkSync(tmpBannerPath);
+          if (fs.existsSync(tmpHook)) fs.unlinkSync(tmpHook);
           resolve();
         })
         .on('error', (err) => {
@@ -364,9 +322,7 @@ function applyOverlay(input, config, bannerPath) {
         })
         .run();
 
-    } catch (err) {
-      reject(err);
-    }
+    } catch (err) { reject(err); }
   });
 }
 
