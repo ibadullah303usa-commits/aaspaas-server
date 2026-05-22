@@ -45,6 +45,20 @@ for (const fp of FONT_PATHS) {
   }
 }
 
+function cutVideo(input, output, start, end) {
+  const startSec = parseFloat(start) || 0;
+  const endSec   = parseFloat(end)   || 15;
+  const duration = Math.max(endSec - startSec, 1);
+  return new Promise((resolve, reject) => {
+    ffmpeg(input)
+      .setStartTime(startSec)
+      .setDuration(duration)
+      .output(output)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+}
 // ============================================================
 // WATCH JOBS
 // ============================================================
