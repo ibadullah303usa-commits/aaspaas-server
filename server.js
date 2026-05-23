@@ -187,29 +187,16 @@ function applyOverlay(input, config, bannerPath, tmpDir) {
       const tmpBannerPath  = config.out.replace('.mp4', '_banner_scaled.png');
 
       // ── 1. Browser se aayi PNG download karo (hook + banner already burned) ──
-      let overlayExists = false;
-      if (config.pngUrl && config.pngUrl.startsWith('data:image')) {
-  try {
-    const base64Data = config.pngUrl.replace(/^data:image\/\w+;base64,/, '');
-    fs.writeFileSync(tmpOverlayPath, Buffer.from(base64Data, 'base64'));
-    overlayExists = fs.existsSync(tmpOverlayPath);
-    console.log('✓ Overlay PNG from base64:', tmpOverlayPath);
-  } catch(e) {
-    console.warn('Overlay PNG base64 write failed:', e.message);
+      // Server khud hook image banata hai — browser se PNG nahi aati
+let overlayExists = false;
+const safeHook = (config.hook || '').trim();
+if (safeHook) {
+  const hookBuf = await createHookImage(safeHook, config.hookColor, 1080);
+  if (hookBuf) {
+    fs.writeFileSync(tmpHookPath, hookBuf);
+    overlayExists = true;
   }
 }
-
-      // ── 2. Agar browser PNG nahi aayi to server side banao (fallback) ──
-      if (!overlayExists) {
-        const safeHook = (config.hook || '').trim();
-        if (safeHook) {
-          const hookBuf = await createHookImage(safeHook, config.hookColor, 1080);
-          if (hookBuf) {
-            fs.writeFileSync(tmpOverlayPath, hookBuf);
-            overlayExists = true;
-          }
-        }
-      }
 
       // ── 3. Banner scale karo ──
       let bannerExists = false;
