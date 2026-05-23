@@ -143,103 +143,111 @@ function cutVideo(input, output, start, end) {
 // ✅ FIX: Sirf client se aaye hue PNGs use karein
 // کوئی createHookImage nahi, کوئی font nahi
 // ============================================================
-async function makeThreeVariantsWithClientPNGs(cutPath, tmpDir, job) {
-  const variants = [];
-  
-  // Client already created PNGs for each hook
-  const hookPNGs = [
-    job.hook1PngData || '',
-    job.hook2PngData || '',
-    job.hook3PngData || ''
-  ];
-  
-  // Positions - client ke mutabiq
-  const configs = [
-    { hookPos: 'top', bannerPos: 'bottom' },    // V1
-    { hookPos: 'top', bannerPos: 'bottom' },    // V2
-    { hookPos: 'bottom', bannerPos: 'top' }     // V3
-  ];
-  
-  for (let i = 0; i < 3; i++) {
-    const outPath = `${tmpDir}/v${i+1}.mp4`;
-    
-    // Download hook PNG from URL if it exists
-    let hookPath = null;
-    if (hookPNGs[i]) {
-      hookPath = `${tmpDir}/hook${i+1}.png`;
-      await downloadFile(hookPNGs[i], hookPath);
+async function makeThreeVariants(cutPath, tmpDir, job, bannerPath) {
+  const variants = [
+    {
+      out:       `${tmpDir}/v1.mp4`,
+      hook:      job.hook1 || '',
+      hookColor: '#FF0000',
+      hookPos:   'top',
+      bannerPos: 'bottom',
+      pngUrl:    job.hook1PngData || '',
+    },
+    {
+      out:       `${tmpDir}/v2.mp4`,
+      hook:      job.hook2 || '',
+      hookColor: '#0066FF',
+      hookPos:   'top',
+      bannerPos: 'bottom',
+      pngUrl:    job.hook2PngData || '',
+    },
+    {
+      out:       `${tmpDir}/v3.mp4`,
+      hook:      job.hook3 || '',
+      hookColor: '#8A2BE2',
+      hookPos:   'bottom',
+      bannerPos: 'top',
+      pngUrl:    job.hook3PngData || '',
     }
-    
-    // Download banner if exists
-    let bannerPath = null;
-    if (job.bannerUrl && job.bannerUrl.startsWith('http')) {
-      bannerPath = `${tmpDir}/banner.png`;
-      await downloadFile(job.bannerUrl, bannerPath);
-    } else if (job.bannerUrl && job.bannerUrl.startsWith('data:image')) {
-      bannerPath = `${tmpDir}/banner.png`;
-      const base64Data = job.bannerUrl.replace(/^data:image\/\w+;base64,/, '');
-      fs.writeFileSync(bannerPath, Buffer.from(base64Data, 'base64'));
-    }
-    
-    // Apply overlay using FFmpeg with the PNGs
-    await applyOverlayWithPNG(cutPath, outPath, hookPath, bannerPath, configs[i]);
-    
-    variants.push({
-      out: outPath,
-      hook: job[`hook${i+1}`] || '',
-      hookPos: configs[i].hookPos,
-      bannerPos: configs[i].bannerPos
-    });
+  ];
+
+  for (const v of variants) {
+    await applyOverlay(cutPath, v, bannerPath, tmpDir);
   }
-  
   return variants;
 }
 
 // ============================================================
 // ✅ SIMPLE: Sirf existing PNGs ko overlay karein - no text rendering
 // ============================================================
-function applyOverlayWithPNG(input, output, hookPath, bannerPath, config) {
-  return new Promise((resolve, reject) => {
+function applyOverlay(input, config, bannerPath, tmpDir) {
+  return new Promise(async (resolve, reject) => {
     try {
-      const hookY   = config.hookPos === 'top' 
-        ? '(H*0.21)-(h/2)' 
-        : '(H*0.65)-(h/2)';
-      const bannerY = config.bannerPos === 'top' 
-        ? '(H*0.21)-(h/2)' 
-        : '(H*0.65)-(h/2)';
-      
-      const inputs = [input];
-      let filterParts = [];
-      
-      if (hookPath && fs.existsSync(hookPath)) {
-        inputs.push(hookPath);
-        filterParts.push(`[${inputs.length-1}:v]overlay=(W-w)/2:${hookY}`);
-      }
-      
-      if (bannerPath && fs.existsSync(bannerPath)) {
-        inputs.push(bannerPath);
-        filterParts.push(`[${inputs.length-1}:v]overlay=(W-w)/2:${bannerY}`);
-      }
-      
-      let filterChain = '';
-      if (filterParts.length === 0) {
-        filterChain = '[0:v]copy[out]';
-      } else if (filterParts.length === 1) {
-        filterChain = `[0:v]${filterParts[0]}[out]`;
-      } else {
-        // Chain multiple overlays
-        let chain = `[0:v]${filterParts[0]}[tmp1]`;
-        for (let i = 1; i < filterParts.length; i++) {
-          const prev = i === 1 ? 'tmp1' : `tmp${i}`;
-          const next = i === filterParts.length - 1 ? 'out' : `tmp${i+1}`;
-          chain += `;[${prev}]${filterParts[i]}[${next}]`;
+      const tmpOverlayPath = config.out.replace('.mp4', '_overlay.png');
+      const tmpBannerPath  = config.out.replace('.mp4', '_banner_scaled.png');
+
+      // ── 1. Browser se aayi PNG download karo (hook + banner already burned) ──
+      let overlayExists = false;
+      if (config.pngUrl && config.pngUrl.startsWith('http')) {
+        try {
+          await downloadFile(config.pngUrl, tmpOverlayPath);
+          overlayExists = fs.existsSync(tmpOverlayPath);
+        } catch(e) {
+          console.warn('Overlay PNG download failed:', e.message);
         }
-        filterChain = chain;
       }
-      
-      const cmd = ffmpeg();
-      inputs.forEach(inp => cmd.input(inp));
-      
+
+      // ── 2. Agar browser PNG nahi aayi to server side banao (fallback) ──
+      if (!overlayExists) {
+        const safeHook = (config.hook || '').trim();
+        if (safeHook) {
+          const hookBuf = await createHookImage(safeHook, config.hookColor, 1080);
+          if (hookBuf) {
+            fs.writeFileSync(tmpOverlayPath, hookBuf);
+            overlayExists = true;
+          }
+        }
+      }
+
+      // ── 3. Banner scale karo ──
+      let bannerExists = false;
+      if (bannerPath && fs.existsSync(bannerPath)) {
+        await sharp(bannerPath)
+          .resize({ width: 900, fit: 'inside' })
+          .png()
+          .toFile(tmpBannerPath);
+        bannerExists = true;
+      }
+
+      // ── 4. Overlay positions ──
+      // Browser PNG (1080x1920) — poori video size ka hai, isliye x=0, y=0
+      // Agar fallback hook pill hai to center karo
+      const isPngFullFrame = config.pngUrl && config.pngUrl.startsWith('http') && overlayExists;
+
+      const overlayX = isPngFullFrame ? '0' : '(W-w)/2';
+      const overlayY = isPngFullFrame ? '0' : (config.hookPos === 'top' ? '(H*0.21)-(h/2)' : '(H*0.65)-(h/2)');
+      const bannerY  = config.bannerPos === 'top' ? '(H*0.21)-(h/2)' : '(H*0.65)-(h/2)';
+
+      // ── 5. FFmpeg command ──
+      const cmd = ffmpeg(input);
+
+      const inputsList = [];
+      if (overlayExists) inputsList.push({ path: tmpOverlayPath, x: overlayX, y: overlayY });
+      if (bannerExists)  inputsList.push({ path: tmpBannerPath,  x: '(W-w)/2', y: bannerY  });
+
+      inputsList.forEach(inp => cmd.input(inp.path));
+
+      let filterChain = '';
+      if (inputsList.length === 0) {
+        filterChain = '[0:v]copy[out]';
+      } else if (inputsList.length === 1) {
+        filterChain = `[0:v][1:v]overlay=${inputsList[0].x}:${inputsList[0].y}[out]`;
+      } else {
+        filterChain =
+          `[0:v][1:v]overlay=${inputsList[0].x}:${inputsList[0].y}[tmp];` +
+          `[tmp][2:v]overlay=${inputsList[1].x}:${inputsList[1].y}[out]`;
+      }
+
       cmd
         .complexFilter(filterChain)
         .map('[out]')
@@ -250,17 +258,23 @@ function applyOverlayWithPNG(input, output, hookPath, bannerPath, config) {
           '-c:a copy',
           '-movflags +faststart'
         ])
-        .output(output)
-        .on('end', resolve)
-        .on('error', reject)
+        .output(config.out)
+        .on('end', () => {
+          if (fs.existsSync(tmpOverlayPath)) fs.unlinkSync(tmpOverlayPath);
+          if (fs.existsSync(tmpBannerPath))  fs.unlinkSync(tmpBannerPath);
+          resolve();
+        })
+        .on('error', (err) => {
+          console.error('FFmpeg error:', err.message);
+          reject(err);
+        })
         .run();
-        
+
     } catch (err) {
       reject(err);
     }
   });
 }
-
 async function uploadVariantsToBunny(variants, job) {
   const bunnyKey  = process.env.BUNNY_API_KEY;
   const bunnyZone = process.env.BUNNY_STORAGE_ZONE;
