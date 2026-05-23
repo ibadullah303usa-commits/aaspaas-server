@@ -81,12 +81,18 @@ async function processJob(jobId, job) {
 
     await updateJob(jobId, 'processing', 40, '3 ویریئنٹ بن رہے ہیں');
 
-    // ✅ FIX: Server sirf client se aaye hue PNGs use karega
-    // کوئی نیا ٹیکسٹ رینڈر نہیں، کوئی فونٹ لوڈنگ نہیں
+// Banner download
+let bannerPath = null;
+if (job.bannerUrl && job.bannerUrl.startsWith('data:image')) {
+  bannerPath = `${tmpDir}/banner.png`;
+  const base64Data = job.bannerUrl.replace(/^data:image\/\w+;base64,/, '');
+  fs.writeFileSync(bannerPath, Buffer.from(base64Data, 'base64'));
+} else if (job.bannerUrl && job.bannerUrl.startsWith('http')) {
+  bannerPath = `${tmpDir}/banner.png`;
+  await downloadFile(job.bannerUrl, bannerPath);
+}
 
-    // 3 variants banayein - client ke PNGs ke saath
-    const variants = await makeThreeVariants(cutPath, tmpDir, job, bannerPath);
-
+const variants = await makeThreeVariants(cutPath, tmpDir, job, bannerPath);
     await updateJob(jobId, 'processing', 80, 'Bunny پر اپلوڈ ہو رہا ہے');
     const urls = await uploadVariantsToBunny(variants, job);
 
