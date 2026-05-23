@@ -81,19 +81,11 @@ async function processJob(jobId, job) {
 
     await updateJob(jobId, 'processing', 40, '3 ویریئنٹ بن رہے ہیں');
 
-    // Banner download
-    let bannerPath = null;
-    if (job.bannerUrl && job.bannerUrl.startsWith('data:image')) {
-      bannerPath = `${tmpDir}/banner.png`;
-      const base64Data = job.bannerUrl.replace(/^data:image\/\w+;base64,/, '');
-      fs.writeFileSync(bannerPath, Buffer.from(base64Data, 'base64'));
-    } else if (job.bannerUrl && job.bannerUrl.startsWith('http')) {
-      bannerPath = `${tmpDir}/banner.png`;
-      await downloadFile(job.bannerUrl, bannerPath);
-    }
+    // ✅ FIX: Server sirf client se aaye hue PNGs use karega
+    // کوئی نیا ٹیکسٹ رینڈر نہیں، کوئی فونٹ لوڈنگ نہیں
 
-    // 3 variants banayein
-    const variants = await makeThreeVariants(cutPath, tmpDir, job, bannerPath);
+    // 3 variants banayein - client ke PNGs ke saath
+    const variants = await makeThreeVariantsWithClientPNGs(cutPath, tmpDir, job);
 
     await updateJob(jobId, 'processing', 80, 'Bunny پر اپلوڈ ہو رہا ہے');
     const urls = await uploadVariantsToBunny(variants, job);
@@ -103,7 +95,6 @@ async function processJob(jobId, job) {
 
     await updateJob(jobId, 'done', 100, 'مکمل ✓');
 
-    // Cleanup
     fs.rmSync(tmpDir, { recursive: true, force: true });
 
   } catch (err) {
@@ -118,9 +109,7 @@ async function updateJob(jobId, status, progress, message) {
     await db.collection('editing_jobs').doc(jobId).update({
       status, progress, message, updatedAt: Date.now()
     });
-  } catch (e) {
-    // job already deleted — ignore
-  }
+  } catch (e) {}
 }
 
 function downloadFile(url, dest) {
@@ -151,208 +140,106 @@ function cutVideo(input, output, start, end) {
 }
 
 // ============================================================
-// 3 VARIANTS CONFIG — prompt ke mutabiq
-// V1: Red  (#FF0000) — hook top 21%,    banner bottom 65%
-// V2: Blue (#0066FF) — hook top 21%,    banner bottom 65%
-// V3: Purple (#8A2BE2) — hook bottom 65%, banner top 21%
+// ✅ FIX: Sirf client se aaye hue PNGs use karein
+// کوئی createHookImage nahi, کوئی font nahi
 // ============================================================
-async function makeThreeVariants(cutPath, tmpDir, job, bannerPath) {
-  const variants = [
-    {
-      out:        `${tmpDir}/v1.mp4`,
-      hook:       job.hook1 || '',
-      hookColor:  '#FF0000',   // Solid Red
-      hookPos:    'top',       // 21%
-      bannerPos:  'bottom',    // 65%
-    },
-    {
-      out:        `${tmpDir}/v2.mp4`,
-      hook:       job.hook2 || '',
-      hookColor:  '#0066FF',   // Solid Blue
-      hookPos:    'top',       // 21%
-      bannerPos:  'bottom',    // 65%
-    },
-    {
-      out:        `${tmpDir}/v3.mp4`,
-      hook:       job.hook3 || '',
-      hookColor:  '#8A2BE2',   // Solid Purple
-      hookPos:    'bottom',    // 65%
-      bannerPos:  'top',       // 21%
-    }
+async function makeThreeVariantsWithClientPNGs(cutPath, tmpDir, job) {
+  const variants = [];
+  
+  // Client already created PNGs for each hook
+  const hookPNGs = [
+    job.hook1PngData || '',
+    job.hook2PngData || '',
+    job.hook3PngData || ''
   ];
-
-  for (const v of variants) {
-    await applyOverlay(cutPath, v, bannerPath);
+  
+  // Positions - client ke mutabiq
+  const configs = [
+    { hookPos: 'top', bannerPos: 'bottom' },    // V1
+    { hookPos: 'top', bannerPos: 'bottom' },    // V2
+    { hookPos: 'bottom', bannerPos: 'top' }     // V3
+  ];
+  
+  for (let i = 0; i < 3; i++) {
+    const outPath = `${tmpDir}/v${i+1}.mp4`;
+    
+    // Download hook PNG from URL if it exists
+    let hookPath = null;
+    if (hookPNGs[i]) {
+      hookPath = `${tmpDir}/hook${i+1}.png`;
+      await downloadFile(hookPNGs[i], hookPath);
+    }
+    
+    // Download banner if exists
+    let bannerPath = null;
+    if (job.bannerUrl && job.bannerUrl.startsWith('http')) {
+      bannerPath = `${tmpDir}/banner.png`;
+      await downloadFile(job.bannerUrl, bannerPath);
+    } else if (job.bannerUrl && job.bannerUrl.startsWith('data:image')) {
+      bannerPath = `${tmpDir}/banner.png`;
+      const base64Data = job.bannerUrl.replace(/^data:image\/\w+;base64,/, '');
+      fs.writeFileSync(bannerPath, Buffer.from(base64Data, 'base64'));
+    }
+    
+    // Apply overlay using FFmpeg with the PNGs
+    await applyOverlayWithPNG(cutPath, outPath, hookPath, bannerPath, configs[i]);
+    
+    variants.push({
+      out: outPath,
+      hook: job[`hook${i+1}`] || '',
+      hookPos: configs[i].hookPos,
+      bannerPos: configs[i].bannerPos
+    });
   }
+  
   return variants;
 }
 
 // ============================================================
-// CREATE HOOK IMAGE — Canvas se pill shape, Urdu text
+// ✅ SIMPLE: Sirf existing PNGs ko overlay karein - no text rendering
 // ============================================================
-async function createHookImage(text, bgColorHex, videoWidth = 1080) {
-  if (!text || !text.trim()) return null;
-
-  const MAX_WIDTH    = Math.floor(videoWidth * 0.82); // 82% of screen
-  const PADDING_X    = 36;
-  const FONT_SIZE    = 54;
-  const LINE_HEIGHT  = FONT_SIZE * 1.5;
-  const PILL_HEIGHT  = Math.floor(LINE_HEIGHT + 20); // tight wrap
-  const BORDER_RAD   = PILL_HEIGHT / 2;
-
-  // Canvas measure karo — text width ke liye
-  const measureCanvas = createCanvas(MAX_WIDTH * 2, PILL_HEIGHT * 2);
-  const mCtx = measureCanvas.getContext('2d');
-  mCtx.font = `bold ${FONT_SIZE}px "${FONT_FAMILY}"`;
-
-  const measured = mCtx.measureText(text).width;
-  // Auto-adjust: agar text bada ho to font chhota karo
-  let finalFontSize = FONT_SIZE;
-  let finalWidth = Math.min(measured + PADDING_X * 2, MAX_WIDTH);
-
-  if (measured + PADDING_X * 2 > MAX_WIDTH) {
-    // Font shrink karo proportionally
-    const ratio = (MAX_WIDTH - PADDING_X * 2) / measured;
-    finalFontSize = Math.max(Math.floor(FONT_SIZE * ratio), 28);
-    mCtx.font = `bold ${finalFontSize}px "${FONT_FAMILY}"`;
-    const remeasured = mCtx.measureText(text).width;
-    finalWidth = Math.min(remeasured + PADDING_X * 2, MAX_WIDTH);
-  }
-
-  const finalHeight = Math.floor(finalFontSize * 1.6 + 18);
-  const finalRadius = finalHeight / 2;
-
-  // Actual canvas
-  const canvas = createCanvas(finalWidth, finalHeight);
-  const ctx = canvas.getContext('2d');
-
-  // Background: pill shape with glossy gradient
-  ctx.clearRect(0, 0, finalWidth, finalHeight);
-
-  // Parse hex color
-  const r = parseInt(bgColorHex.slice(1, 3), 16);
-  const g = parseInt(bgColorHex.slice(3, 5), 16);
-  const b = parseInt(bgColorHex.slice(5, 7), 16);
-
-  // Glossy gradient — top lighter, bottom solid
-  const grad = ctx.createLinearGradient(0, 0, 0, finalHeight);
-  grad.addColorStop(0,   `rgba(${r+40},${g+40},${b+40},0.97)`);
-  grad.addColorStop(0.5, `rgba(${r},${g},${b},0.95)`);
-  grad.addColorStop(1,   `rgba(${Math.max(r-20,0)},${Math.max(g-20,0)},${Math.max(b-20,0)},0.98)`);
-
-  // Draw pill
-  ctx.beginPath();
-  ctx.moveTo(finalRadius, 0);
-  ctx.arcTo(finalWidth, 0, finalWidth, finalHeight, finalRadius);
-  ctx.arcTo(finalWidth, finalHeight, 0, finalHeight, finalRadius);
-  ctx.arcTo(0, finalHeight, 0, 0, finalRadius);
-  ctx.arcTo(0, 0, finalWidth, 0, finalRadius);
-  ctx.closePath();
-  ctx.fillStyle = grad;
-  ctx.fill();
-
-  // Subtle inner glow on top edge
-  const gloss = ctx.createLinearGradient(0, 0, 0, finalHeight * 0.5);
-  gloss.addColorStop(0, 'rgba(255,255,255,0.18)');
-  gloss.addColorStop(1, 'rgba(255,255,255,0)');
-  ctx.fillStyle = gloss;
-  ctx.fill();
-
-  // Text shadow
-  ctx.shadowColor   = 'rgba(0,0,0,0.65)';
-  ctx.shadowBlur    = 8;
-  ctx.shadowOffsetX = 0;
-  ctx.shadowOffsetY = 2;
-
-  // Text
-  ctx.font      = `bold ${finalFontSize}px "${FONT_FAMILY}"`;
-  ctx.fillStyle = '#FFFFFF';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.direction    = 'rtl';
-
-  // Slight vertical overflow effect — text center slightly above midpoint
-  const textY = finalHeight * 0.50;
-  ctx.fillText(text, finalWidth / 2, textY);
-
-  return canvas.toBuffer('image/png');
-}
-
-// ============================================================
-// APPLY OVERLAY — FFmpeg se hook + banner lagao
-// ============================================================
-function applyOverlay(input, config, bannerPath) {
-  return new Promise(async (resolve, reject) => {
+function applyOverlayWithPNG(input, output, hookPath, bannerPath, config) {
+  return new Promise((resolve, reject) => {
     try {
-      const tmpHookPath   = config.out.replace('.mp4', '_hook.png');
-      const tmpBannerPath = config.out.replace('.mp4', '_banner_scaled.png');
-
-      const safeHook = (config.hook || '').trim();
-
-      // 1. Hook image banao
-      let hookExists = false;
-      if (safeHook) {
-        // SIMPLE: Create a colored pill without text - client already has the hook PNGs
-        // Just create a colored rectangle with no text
-        const canvas = createCanvas(800, 120);
-        const ctx = canvas.getContext('2d');
-        const r = parseInt(config.hookColor.slice(1, 3), 16);
-        const g = parseInt(config.hookColor.slice(3, 5), 16);
-        const b = parseInt(config.hookColor.slice(5, 7), 16);
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-        ctx.beginPath();
-        ctx.arc(400, 60, 60, 0, Math.PI * 2);
-        ctx.fill();
-        const hookBuf = canvas.toBuffer('image/png');
-        if (hookBuf) {
-          fs.writeFileSync(tmpHookPath, hookBuf);
-          hookExists = true;
-        }
+      const hookY   = config.hookPos === 'top' 
+        ? '(H*0.21)-(h/2)' 
+        : '(H*0.65)-(h/2)';
+      const bannerY = config.bannerPos === 'top' 
+        ? '(H*0.21)-(h/2)' 
+        : '(H*0.65)-(h/2)';
+      
+      const inputs = [input];
+      let filterParts = [];
+      
+      if (hookPath && fs.existsSync(hookPath)) {
+        inputs.push(hookPath);
+        filterParts.push(`[${inputs.length-1}:v]overlay=(W-w)/2:${hookY}`);
       }
-
-      // 2. Banner scale karo
-      let bannerExists = false;
+      
       if (bannerPath && fs.existsSync(bannerPath)) {
-        await sharp(bannerPath)
-          .resize({ width: 900, fit: 'inside' })
-          .png()
-          .toFile(tmpBannerPath);
-        bannerExists = true;
+        inputs.push(bannerPath);
+        filterParts.push(`[${inputs.length-1}:v]overlay=(W-w)/2:${bannerY}`);
       }
-
-      // 3. FFmpeg overlay positions
-      // hookPos  'top'    => H*0.21 - h/2  (centered at 21%)
-      // hookPos  'bottom' => H*0.65 - h/2  (centered at 65%)
-      // bannerPos same logic
-      const hookY   = config.hookPos   === 'top'
-        ? '(H*0.21)-(h/2)'
-        : '(H*0.65)-(h/2)';
-      const bannerY = config.bannerPos === 'top'
-        ? '(H*0.21)-(h/2)'
-        : '(H*0.65)-(h/2)';
-
-      // Inputs list
-      const inputsList = [];
-      if (hookExists)   inputsList.push({ path: tmpHookPath,   y: hookY });
-      if (bannerExists) inputsList.push({ path: tmpBannerPath, y: bannerY });
-
-      // FFmpeg command build karo
-      const cmd = ffmpeg(input);
-      inputsList.forEach(inp => cmd.input(inp.path));
-
+      
       let filterChain = '';
-      if (inputsList.length === 0) {
-        // Koi overlay nahi — seedha copy karo
+      if (filterParts.length === 0) {
         filterChain = '[0:v]copy[out]';
-      } else if (inputsList.length === 1) {
-        filterChain = `[0:v][1:v]overlay=(W-w)/2:${inputsList[0].y}[out]`;
+      } else if (filterParts.length === 1) {
+        filterChain = `[0:v]${filterParts[0]}[out]`;
       } else {
-        // 2 overlays — hook pehle, banner baad mein
-        filterChain =
-          `[0:v][1:v]overlay=(W-w)/2:${inputsList[0].y}[tmp];` +
-          `[tmp][2:v]overlay=(W-w)/2:${inputsList[1].y}[out]`;
+        // Chain multiple overlays
+        let chain = `[0:v]${filterParts[0]}[tmp1]`;
+        for (let i = 1; i < filterParts.length; i++) {
+          const prev = i === 1 ? 'tmp1' : `tmp${i}`;
+          const next = i === filterParts.length - 1 ? 'out' : `tmp${i+1}`;
+          chain += `;[${prev}]${filterParts[i]}[${next}]`;
+        }
+        filterChain = chain;
       }
-
+      
+      const cmd = ffmpeg();
+      inputs.forEach(inp => cmd.input(inp));
+      
       cmd
         .complexFilter(filterChain)
         .map('[out]')
@@ -363,27 +250,17 @@ function applyOverlay(input, config, bannerPath) {
           '-c:a copy',
           '-movflags +faststart'
         ])
-        .output(config.out)
-        .on('end', () => {
-          if (fs.existsSync(tmpHookPath))   fs.unlinkSync(tmpHookPath);
-          if (fs.existsSync(tmpBannerPath)) fs.unlinkSync(tmpBannerPath);
-          resolve();
-        })
-        .on('error', (err) => {
-          console.error('FFmpeg error:', err.message);
-          reject(err);
-        })
+        .output(output)
+        .on('end', resolve)
+        .on('error', reject)
         .run();
-
+        
     } catch (err) {
       reject(err);
     }
   });
 }
 
-// ============================================================
-// BUNNY UPLOAD
-// ============================================================
 async function uploadVariantsToBunny(variants, job) {
   const bunnyKey  = process.env.BUNNY_API_KEY;
   const bunnyZone = process.env.BUNNY_STORAGE_ZONE;
@@ -406,50 +283,38 @@ async function uploadVariantsToBunny(variants, job) {
     );
 
     urls.push({
-      url:       `${bunnyCdn}/${filename}`,
-      hook:      v.hook,
-      hookPos:   v.hookPos,
-      bannerPos: v.bannerPos,
-      hookColor: v.hookColor
+      url: `${bunnyCdn}/${filename}`,
+      hook: v.hook,
+      hookPos: v.hookPos,
+      bannerPos: v.bannerPos
     });
   }
   return urls;
 }
 
-// ============================================================
-// SAVE TO FEED — prompt ke mutabiq classes
-// ============================================================
 async function saveToFeed(urls, job) {
   const uid = Date.now();
-
-  // hook-v1 = Red, hook-v2 = Blue, hook-v3 = Purple
-  const hookClasses   = ['hook-v1', 'hook-v2', 'hook-v3'];
-  // Variant 1 & 2: hook top, banner bottom
-  // Variant 3: hook bottom, banner top
-  const textClasses   = ['hook-top', 'hook-top', 'hook-bottom'];
+  const hookClasses = ['hook-v1', 'hook-v2', 'hook-v3'];
+  const textClasses = ['hook-top', 'hook-top', 'hook-bottom'];
   const bannerClasses = ['banner-bottom', 'banner-bottom', 'banner-top'];
 
   for (let i = 0; i < urls.length; i++) {
     const u = urls[i];
     await db.collection('marketing_feed').add({
-      id:                  `sv${i + 1}_${uid}`,
-      mediaUrl:            u.url,
-      mediaType:           'video',
-      hookText:            u.hook || '',
-      caption:             job.captions ? (job.captions[i] || '') : '',
-      bannerUrl:           job.bannerUrl || '',
-      // User HTML mein: hook-top hook-v1 etc.
-      textPositionClass:   `${textClasses[i]} ${hookClasses[i]}`,
+      id: `sv${i + 1}_${uid}`,
+      mediaUrl: u.url,
+      mediaType: 'video',
+      hookText: u.hook || '',
+      caption: job.captions ? (job.captions[i] || '') : '',
+      bannerUrl: job.bannerUrl || '',
+      textPositionClass: `${textClasses[i]} ${hookClasses[i]}`,
       bannerPositionClass: bannerClasses[i],
-      timestamp:           uid - i,
-      extCaps:             job.extCaps || {}
+      timestamp: uid - i,
+      extCaps: job.extCaps || {}
     });
   }
 }
 
-// ============================================================
-// SERVER START
-// ============================================================
 app.get('/', (req, res) => res.send('Aaspaas Server Running ✓'));
 watchJobs();
 app.listen(3000, () => console.log('Server on port 3000'));
