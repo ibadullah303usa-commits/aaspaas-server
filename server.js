@@ -85,7 +85,7 @@ async function processJob(jobId, job) {
     // کوئی نیا ٹیکسٹ رینڈر نہیں، کوئی فونٹ لوڈنگ نہیں
 
     // 3 variants banayein - client ke PNGs ke saath
-    const variants = await makeThreeVariantsWithClientPNGs(cutPath, tmpDir, job);
+    const variants = await makeThreeVariants(cutPath, tmpDir, job, bannerPath);
 
     await updateJob(jobId, 'processing', 80, 'Bunny پر اپلوڈ ہو رہا ہے');
     const urls = await uploadVariantsToBunny(variants, job);
