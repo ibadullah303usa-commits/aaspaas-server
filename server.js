@@ -188,14 +188,16 @@ function applyOverlay(input, config, bannerPath, tmpDir) {
 
       // ── 1. Browser se aayi PNG download karo (hook + banner already burned) ──
       let overlayExists = false;
-      if (config.pngUrl && config.pngUrl.startsWith('http')) {
-        try {
-          await downloadFile(config.pngUrl, tmpOverlayPath);
-          overlayExists = fs.existsSync(tmpOverlayPath);
-        } catch(e) {
-          console.warn('Overlay PNG download failed:', e.message);
-        }
-      }
+      if (config.pngUrl && config.pngUrl.startsWith('data:image')) {
+  try {
+    const base64Data = config.pngUrl.replace(/^data:image\/\w+;base64,/, '');
+    fs.writeFileSync(tmpOverlayPath, Buffer.from(base64Data, 'base64'));
+    overlayExists = fs.existsSync(tmpOverlayPath);
+    console.log('✓ Overlay PNG from base64:', tmpOverlayPath);
+  } catch(e) {
+    console.warn('Overlay PNG base64 write failed:', e.message);
+  }
+}
 
       // ── 2. Agar browser PNG nahi aayi to server side banao (fallback) ──
       if (!overlayExists) {
